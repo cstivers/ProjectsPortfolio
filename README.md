@@ -8,3 +8,5 @@ boozeRus_report.pdf: Report of a project investigating factors that influence li
 nba_prediction_project.html: Report of a project investigating factors that influence outcomes of Denver Nuggets games using Bayesian logistic regression analysis
 
 restaurant_ratings_prediction.ipynb: Notebook of a project that predicts the ratings of unreviewed restaurants in an UberEats dataset using machine learning methods
+
+research_poster.pdf: Poster used at a conference summarizing outcomes gained from undergraduate research 
