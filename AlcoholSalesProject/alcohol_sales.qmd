@@ -1,0 +1,541 @@
+---
+title: "Alcohol Sales"
+format: html
+editor: visual
+jupyter: python3
+---
+
+```{python}
+import requests
+import pandas as pd
+#response = requests.get("https://data.iowa.gov/resource/m3tr-qhgy.json?county=ADAMS&$limit=1000000")
+response = requests.get("https://data.iowa.gov/resource/m3tr-qhgy.json?$where=date between '2020-01-01T00:00:00' and '2022-12-31T23:00:00'&$limit=50000000")
+```
+
+```{python}
+data_alcohol = response.json()
+df = pd.json_normalize(data_alcohol)
+```
+
+```{r}
+# import libraries
+library(reticulate)
+library(tidyverse)
+library(lubridate)
+library(tidyr)
+library(httr2)
+library(jsonlite)
+```
+
+```{r}
+if (file.exists("iowa.csv")) {
+  df_reduced <- read_csv("iowa.csv")
+} else {
+  # import data
+  source_python("sales.py")
+  rdf <- get_sales()
+  # data cleaning, removing unnecessary or unused information
+  df_reduced = rdf[,c("county", "date", "vendor_no", "vendor_name", "category", "category_name", "state_bottle_retail", "sale_bottles", "sale_dollars", "sale_gallons")]
+  df_reduced <- df_reduced %>%
+    dplyr::mutate(year = lubridate::year(date), 
+                  month = lubridate::month(date), 
+                  day = lubridate::day(date))
+  
+  df_reduced$sale_gallons = as.numeric(df_reduced$sale_gallons)
+  df_reduced$sale_dollars = as.numeric(df_reduced$sale_dollars)
+  df_reduced$sale_bottles = as.integer(df_reduced$sale_bottles)
+  df_reduced$state_bottle_retail = as.numeric(df_reduced$state_bottle_retail)
+  df_reduced$category = as.factor(df_reduced$category)
+  df_reduced$vendor_no = as.factor(df_reduced$vendor_no)
+  df_reduced$county = as.factor(df_reduced$county)
+  df_reduced$weekday = wday(df_reduced$date, label =T, abbr = F)
+  
+  write.csv(df_reduced, "iowa.csv", row.names=FALSE)
+}
+
+```
+
+```{r}
+# some explorations
+by_weekday <- df_reduced %>%
+  group_by(weekday) %>%
+  summarize(total_sale = sum(sale_dollars))
+ggplot(by_weekday, aes(weekday, total_sale))+
+  scale_y_continuous(labels = scales::comma)+
+  geom_point()
+# Looks like weekday is useless, which makes sense because that is just the day of the week that the store placed the order.
+```
+
+```{r}
+by_day <- df_reduced %>% 
+  group_by(date) %>% 
+  mutate(total_sale = sum(sale_dollars)) %>% 
+  ungroup()
+
+ggplot(by_day, aes(x=factor(weekday, level=c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")), y=total_sale)) +
+  geom_violin() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x="Day of Week", y="Total Sales in a Day",
+       title="Total Sales in a Day by the Day of Week")
+```
+
+```{r}
+by_month <- df_reduced %>%
+  group_by(month) %>%
+  summarize(total_sale = sum(sale_dollars))
+ggplot(by_month, aes(month, total_sale)) +
+  scale_x_continuous(breaks = c(1,2,3,4,5,6,7,8,9,10,11,12)) +
+  scale_y_continuous(labels = scales::comma) +
+  geom_line()
+# Month will be useful in predicting alcohol sales
+```
+
+```{r}
+by_month <- df_reduced %>%
+  group_by(month) %>%
+  summarize(total_sale = sum(sale_gallons))
+ggplot(by_month, aes(x = month, y = total_sale))+
+  scale_y_continuous(labels = scales::comma)+
+  scale_x_continuous(breaks = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))+
+  ylab('Total Volume of Alcohol Purchased (Gallons)')+ 
+  xlab('Month')+ 
+  ggtitle('Total Volume of Alcohol Purchases by Month in 2022')+
+  theme(panel.background = element_blank(), panel.grid.major.y = element_line( size=.1, color="black" ))+
+  geom_bar(stat = 'identity', color = 'turquoise4', fill = 'turquoise4')
+```
+
+```{r}
+# group by county
+by_county <- df_reduced %>%
+  group_by(county) %>%
+  summarize(total_sale = sum(sale_gallons)) %>%
+  arrange(desc(total_sale))
+```
+
+```{r}
+# how strong is the correlation between amount sold and dollars 
+cor(df_reduced[,c('sale_gallons', 'sale_dollars')])
+```
+
+```{r}
+# dummify counties
+df_reduced <- drop_na(df_reduced, county)
+X <- fastDummies::dummy_cols(df_reduced$county)
+X <- X[-1]
+X <- X[-1]
+Y <- df_reduced$sale_dollars
+```
+
+```{r}
+# group by month and county
+by_month_county <- df_reduced %>%
+  group_by(month, county) %>%
+  summarize(monthly_dollars = sum(sale_dollars)) %>%
+  arrange(desc(monthly_dollars))
+by_month_county <- drop_na(by_month_county, county)
+
+gallons_month_county <- df_reduced %>%
+  group_by(month, county) %>%
+  summarize(monthly_gallons = sum(sale_gallons)) %>%
+  arrange(desc(monthly_gallons))
+gallons_month_county <- drop_na(gallons_month_county, county)
+```
+
+```{r}
+# group by year and month and county
+month_year_county <- df_reduced %>%
+  group_by(month, year, county) %>%
+  summarize(monthly_dollars = sum(sale_dollars),
+            monthly_gallons = sum(sale_gallons))
+month_year_county <- drop_na(month_year_county, county)
+```
+
+```{r}
+# population data available from https://www.iowa-demographics.com/counties_by_population
+Iowa_Demographics <- openxlsx::read.xlsx("https://www.iowa-demographics.com/samples/downloads/Iowa_DemographicsByCounty_sample.xlsx", startRow = 5, colNames = TRUE)
+Iowa_Demographics <- Iowa_Demographics[-1,]
+Iowa_Demographics$name <- toupper(gsub(' County', '', x = Iowa_Demographics$name))
+```
+
+```{r}
+# regression function
+regression <- function(X, Y, lambda = 0, intercept = T){
+  if(intercept == T){X <- cbind(1, X)}
+  BETA <- solve(t(X)%*%X + (lambda * diag(ncol(X))))%*%(t(X)%*%Y)
+  return(BETA)
+}
+```
+
+```{r}
+# Cross Validation and Ridge Estimation
+CV_Model_Scoring <- function(X, Y, splits, lambdas, metric = "R2", intercept = T){
+  i <- 0
+  indicies <- sample(1:nrow(X))
+  df <- data.frame(matrix(ncol = 2, nrow = 0))
+  colnames(df) <- c('score', 'lambda')
+  while (i < splits){
+    testIndicies <- na.omit(indicies[((i/splits)*nrow(X)):((((i+1)/splits)*nrow(X))-1)])
+    trainX <- X[-testIndicies,]
+    testX <- X[testIndicies,]
+    if(intercept == T){testX <- cbind(1, testX)}
+    trainY <- Y[-testIndicies]
+    testY <- Y[testIndicies]
+    for(lambda in lambdas){
+      BETA <- regression(trainX, trainY, lambda)
+      yhat <- testX %*% BETA
+      if(metric == "MSE"){
+        error <- testY - yhat
+        MSE <- sum(error^2)/length(testX)
+        df[nrow(df) + 1,] <- c(R2, lambda)
+      }
+      else if(metric == "ADJR2"){
+        error <- testY - yhat
+        MSE <- sum(error^2)/length(testX)
+        variance <- sum((testY - mean(testY))^2)/length(testX)
+        R2 <- 1-(MSE/variance)
+        ADJR2 <- 1 - ((1-R2)*(nrow(Y)-1)/(nrow(Y)-ncol(X)-1))
+        df[nrow(df) + 1,] <- c(ADJR2, lambda)
+      }
+      else{
+        error <- testY - yhat
+        MSE <- sum(error^2)/length(testX)
+        variance <- sum((testY - mean(testY))^2)/length(testX)
+        R2 <- 1-(MSE/variance)
+        df[nrow(df) + 1,] <- c(R2, lambda)
+      }
+    }
+    i <- i + 1
+  }
+  toReturn <- data.frame(matrix(ncol = 2, nrow = 0))
+  colnames(toReturn) <- c("lambda", "score")
+  for (lambda in lambdas){
+    toReturn[nrow(toReturn)+1, 1] <- lambda
+    toReturn[nrow(toReturn),2] <- sum(df[df["lambda"] == lambda,]["score"])/splits
+  }
+  return(toReturn)
+}
+```
+
+```{r}
+# predict monthly dollars per county based on month and county
+X <- fastDummies::dummy_cols(by_month_county$county)
+X2 <- fastDummies::dummy_cols(by_month_county$month)
+X2 <- X2[-1]
+X2 <- X2[-1]
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, X2)
+Y <- by_month_county$monthly_dollars
+X <- data.matrix(X)
+Y <- data.matrix(Y)
+scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+lambda = scores[which.max(scores$score), 1]
+regression(X, Y, lambda)
+```
+
+```{r}
+# predict monthly gallons per county based on month and county
+X <- fastDummies::dummy_cols(by_month_county$county)
+X2 <- fastDummies::dummy_cols(by_month_county$month)
+X2 <- X2[-1]
+X2 <- X2[-1]
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, X2)
+Y <- gallons_month_county$monthly_gallons
+X <- data.matrix(X)
+Y <- data.matrix(Y)
+scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+lambda = scores[which.max(scores$score), 1]
+regression(X, Y, lambda)
+```
+
+```{r}
+# include population
+with_pop <- merge(by_month_county, Iowa_Demographics, by.x = 'county', by.y = 'name', all.x = T)
+gal_pop <- merge(gallons_month_county, Iowa_Demographics, by.x = 'county', by.y = 'name', all.x = T)
+with_pop$population <- gsub(',', '', x=with_pop$population)
+with_pop$population <- as.numeric(with_pop$population)
+with_pop$standard_population <- (with_pop$population - mean(with_pop$population)) / sd(with_pop$population)
+gal_pop$population <- gsub(',', '', x=gal_pop$population)
+gal_pop$population <- as.numeric(gal_pop$population)
+gal_pop$standard_population <- (gal_pop$population - mean(gal_pop$population)) / sd(gal_pop$population)
+month_year_county <- merge(month_year_county, Iowa_Demographics, by.x = 'county', by.y = 'name', all.x = T)
+month_year_county$population <- gsub(',', '', x=month_year_county$population)
+month_year_county$population <- as.numeric(month_year_county$population)
+month_year_county$standard_population <- (month_year_county$population - mean(month_year_county$population)) / sd(month_year_county$population)
+mean(month_year_county$population)
+sd(month_year_county$population)
+quantile(month_year_county$population, c(.2, .4, .6, .8))
+month_year_county$county_size <- 'very small'
+month_year_county$county_size[month_year_county$population > quantile(month_year_county$population, .8)] <- 'very large'
+month_year_county$county_size[month_year_county$population <= quantile(month_year_county$population, .8) & month_year_county$population > quantile(month_year_county$population, .6)] <- 'large'
+month_year_county$county_size[month_year_county$population <= quantile(month_year_county$population, .6) & month_year_county$population > quantile(month_year_county$population, .4)] <- 'medium'
+month_year_county$county_size[month_year_county$population <= quantile(month_year_county$population, .4) & month_year_county$population > quantile(month_year_county$population, .2)] <- 'small'
+```
+
+```{r}
+# population distribution
+ggplot(data = Iowa_Demographics, aes(x = as.numeric(gsub(',', '', x = population)))) +
+  geom_histogram(color = "black", fill = 'turquoise3') +
+  ggtitle("Population Distribution in Iowa Counties") + 
+  ylab("Number of Counties") + 
+  xlab("Population Size") + 
+  scale_x_continuous(labels = scales::comma)
+```
+
+```{r}
+# alcohol consumption per person by county size
+month_year_county$county_size <- factor(month_year_county$county_size , levels=c("very large", "large", "medium", "small", "very small"))
+boxplot((monthly_gallons/population) ~ county_size, data = month_year_county,
+        col = "turquoise3", xlab = "County Size (population)", ylab = "Monthly Gallons per Resident", 
+        main = "Monthly Gallons per Resident Grouped by County Size", outpch = 8)
+boxplot((monthly_gallons/population) ~ county_size, data = month_year_county,
+        col = "turquoise3", xlab = "County Size (population)", ylab = "Log Monthly Gallons per Resident", 
+        main = "Monthly Gallons per Resident Grouped by County Size", outpch = 8, log = "y")
+```
+
+```{r}
+# predict monthly sales per person based on month and population
+X <- fastDummies::dummy_cols(with_pop$month)
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, with_pop$standard_population)
+Y <- with_pop$monthly_dollars
+X <- data.matrix(X)
+colnames(X) <- gsub('.data_', '', x = colnames(X))
+Y <- data.matrix(Y)
+scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+lambda = scores[which.max(scores$score), 1]
+regression(X, Y, lambda)
+```
+
+```{r}
+# predict monthly gallons per person based on month and population
+X <- fastDummies::dummy_cols(gal_pop$month)
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, gal_pop$standard_population)
+Y <- gal_pop$monthly_gallons
+X <- data.matrix(X)
+colnames(X) <- gsub('.data_', '', x = colnames(X))
+Y <- data.matrix(Y)
+scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+lambda = scores[which.max(scores$score), 1]
+regression(X, Y, lambda)
+```
+
+```{r}
+# predict monthly costs based on just populaiton
+X <- with_pop$standard_population
+Y <- with_pop$monthly_dollars
+X <- data.matrix(X)
+Y <- data.matrix(Y)
+scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+lambda = scores[which.max(scores$score), 1]
+regression(X, Y, lambda)
+```
+
+```{r}
+# month, year, and population for sale dollars
+X <- fastDummies::dummy_cols(month_year_county$year)
+X2 <- fastDummies::dummy_cols(month_year_county$month)
+X2 <- X2[-1]
+X2 <- X2[-1]
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, X2, month_year_county$standard_population)
+Y <- month_year_county$monthly_dollars
+X <- data.matrix(X)
+colnames(X) <- gsub('.data_', '', x = colnames(X))
+Y <- data.matrix(Y)
+scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+lambda = scores[which.max(scores$score), 1]
+regression(X, Y, lambda)
+```
+
+```{r}
+req = request("https://data.iowa.gov/resource/m3tr-qhgy.json?$query=SELECT%20county,%20date_extract_y(date),%20sum(sale_dollars)%20GROUP%20BY%20county,%20date_extract_y(date)")
+res = req_perform(req)
+rdf_test <- fromJSON(rawToChar(res$body))
+rdf_test$sum_sale_dollars = as.numeric(rdf_test$sum_sale_dollars)
+#rdf_test$county = as.factor(rdf_test$county)
+#rdf_test <- rdf_test %>%
+#  dplyr::mutate(year = lubridate::year(date_extract_y_date))
+rdf_test <- rdf_test[rdf_test["date_extract_y_date"] != "2023",]
+```
+
+```{r}
+for(county in unique(rdf_test["county"])[,1]){
+  temp <- rdf_test[rdf_test["county"] == county,]
+  print(ggplot(temp, aes(date_extract_y_date, sum_sale_dollars, group = 1)) +
+    geom_line()+
+    ggtitle(paste0('plot_',county)))
+  temp$date_extract_y_date = as.numeric(temp$date_extract_y_date)
+  X <- temp$date_extract_y_date
+  Y <- temp$sum_sale_dollars
+  X <- data.matrix(X)
+  Y <- data.matrix(Y)
+  scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+  lambda = scores[which.max(scores$score), 1]
+  regression(X, Y, lambda)
+}
+```
+
+```{r}
+req = request("https://data.iowa.gov/resource/m3tr-qhgy.json?$query=SELECT%20category_name,%20date_extract_y(date),%20sum(sale_dollars)%20GROUP%20BY%20category_name,%20date_extract_y(date)")
+res = req_perform(req)
+rdf_test <- fromJSON(rawToChar(res$body))
+rdf_test$sum_sale_dollars = as.numeric(rdf_test$sum_sale_dollars)
+#rdf_test$county = as.factor(rdf_test$county)
+#rdf_test <- rdf_test %>%
+#  dplyr::mutate(year = lubridate::year(date_extract_y_date))
+rdf_test <- rdf_test[rdf_test["date_extract_y_date"] != "2023",]
+```
+
+```{r}
+for(category_name in unique(rdf_test["category_name"])[,1]){
+  temp <- rdf_test[rdf_test["category_name"] == category_name,]
+  print(ggplot(temp, aes(date_extract_y_date, sum_sale_dollars, group = 1)) +
+    geom_line()+
+    ggtitle(paste0('plot_',category_name)))
+  temp$date_extract_y_date = as.numeric(temp$date_extract_y_date)
+  X <- temp$date_extract_y_date
+  Y <- temp$sum_sale_dollars
+  X <- data.matrix(X)
+  Y <- data.matrix(Y)
+  scores <- CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+  lambda = scores[which.max(scores$score), 1]
+  regression(X, Y, lambda)
+}
+```
+
+```{r}
+# month, year for sale gallons / person
+X <- fastDummies::dummy_cols(month_year_county$year)
+X2 <- fastDummies::dummy_cols(month_year_county$month)
+X3 <- fastDummies::dummy_cols(month_year_county$county_size)
+X3 <- X3[-1]
+X3 <- X3[-1]
+X2 <- X2[-1]
+X2 <- X2[-1]
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, X2, X3)
+Y <- month_year_county$monthly_gallons / month_year_county$population
+X <- data.matrix(X)
+colnames(X) <- gsub('.data_', '', x = colnames(X))
+Y <- data.matrix(Y)
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100), 'ADJR2')
+regression(X, Y, lambda = 0.5)
+```
+
+```{r}
+# month, year for sale dollars / person
+X <- fastDummies::dummy_cols(month_year_county$year)
+X2 <- fastDummies::dummy_cols(month_year_county$month)
+X3 <- fastDummies::dummy_cols(month_year_county$county_size)
+X3 <- X3[-1]
+X3 <- X3[-1]
+X2 <- X2[-1]
+X2 <- X2[-1]
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, X2, X3)
+Y <- month_year_county$monthly_dollars / month_year_county$population
+X <- data.matrix(X)
+colnames(X) <- gsub('.data_', '', x = colnames(X))
+Y <- data.matrix(Y)
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100), 'ADJR2')
+regression(X, Y, lambda = 0.5)
+```
+
+```{r}
+# look at types of alcohol
+whisky <- df_reduced[str_detect(df_reduced$category_name, "WHISK"),]
+rum <- df_reduced[str_detect(df_reduced$category_name, "RUM"),]
+vodka <- df_reduced[str_detect(df_reduced$category_name, "VODKA"),]
+gin <- df_reduced[str_detect(df_reduced$category_name, "GIN"),]
+tequila <- df_reduced[str_detect(df_reduced$category_name, "TEQUILA"),]
+```
+
+```{r}
+# whisky
+whisky_county <- whisky %>%
+  group_by(month, year, county) %>%
+  summarize(monthly_dollars = sum(sale_dollars),
+            monthly_gallons = sum(sale_gallons))
+whisky_county <- drop_na(whisky_county, county)
+whisky_county <- merge(whisky_county, Iowa_Demographics, by.x = 'county', by.y = 'name', all.x = T)
+whisky_county$population <- gsub(',', '', x=whisky_county$population)
+whisky_county$population <- as.numeric(whisky_county$population)
+```
+
+```{r}
+X <- fastDummies::dummy_cols(whisky_county$year)
+X2 <- fastDummies::dummy_cols(whisky_county$month)
+X2 <- X2[-1]
+X2 <- X2[-1]
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, X2)
+Y <- whisky_county$monthly_gallons / whisky_county$population
+X <- data.matrix(X)
+colnames(X) <- gsub('.data_', '', x = colnames(X))
+Y <- data.matrix(Y)
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100), 'ADJR2')
+regression(X, Y, lambda = 0.5)
+```
+
+```{r}
+# category
+df_reduced$cat_type <- 'other'
+df_reduced$cat_type[str_detect(df_reduced$category_name, "GIN")] <- 'gin'
+df_reduced$cat_type[str_detect(df_reduced$category_name, "RUM")] <- 'rum'
+df_reduced$cat_type[str_detect(df_reduced$category_name, "VODKA")] <- 'vodka'
+df_reduced$cat_type[str_detect(df_reduced$category_name, "WHISK")] <- 'whiskey'
+df_reduced$cat_type[str_detect(df_reduced$category_name, "TEQUILA")] <- 'tequila'
+```
+
+```{r}
+category <- df_reduced %>%
+  group_by(month, year, county, cat_type) %>%
+  summarize(monthly_dollars = sum(sale_dollars),
+            monthly_gallons = sum(sale_gallons))
+category <- drop_na(category, county)
+category <- merge(category, Iowa_Demographics, by.x = 'county', by.y = 'name', all.x = T)
+category$population <- gsub(',', '', x=category$population)
+category$population <- as.numeric(category$population)
+category$county_size <- 'very small'
+category$county_size[category$population > quantile(category$population, .8)] <- 'very large'
+category$county_size[category$population <= quantile(category$population, .8) & category$population > quantile(category$population, .6)] <- 'large'
+category$county_size[category$population <= quantile(category$population, .6) & category$population > quantile(category$population, .4)] <- 'medium'
+category$county_size[category$population <= quantile(category$population, .4) & category$population > quantile(category$population, .2)] <- 'small'
+category$cat_type <- factor(category$cat_type , levels=c("other", "gin", "rum", "vodka", "whiskey", "tequila"))
+```
+
+```{r}
+X <- fastDummies::dummy_cols(category$year)
+X2 <- fastDummies::dummy_cols(category$month)
+X3 <- fastDummies::dummy_cols(category$cat_type)
+X4 <- fastDummies::dummy_cols(category$county_size)
+X4 <- X4[-1]
+X4 <- X4[-1]
+X3 <- X3[-1]
+X3 <- X3[-1]
+X2 <- X2[-1]
+X2 <- X2[-1]
+X <- X[-1]
+X <- X[-1]
+X <- cbind(X, X2, X3, X4)
+Y <- category$monthly_gallons / category$population
+X <- data.matrix(X)
+colnames(X) <- gsub('.data_', '', x = colnames(X))
+Y <- data.matrix(Y)
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100))
+CV_Model_Scoring(X, Y, 5, c(0, .1, .5, 1, 10, 100), 'ADJR2')
+regression(X, Y, lambda = 10)
+```
